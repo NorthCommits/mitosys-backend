@@ -138,3 +138,118 @@ async def run_mitosys(task: str) -> dict:
 
     finally:
         root_logger.removeHandler(capture)
+
+
+async def run_mitosys_stream(task: str):
+    """Async generator: runs the 7-stage lifecycle and yields SSE event dicts as they happen."""
+    api_key = os.environ["OPENAI_API_KEY"]
+
+    # ── Stage 1: RECEIVE ────────────────────────────────────────────────────
+    msg = f"Parent agent received the task: '{task}'"
+    logger.info(msg)
+    yield {"type": "log", "message": msg}
+
+    # ── Stage 2: DIVIDE ─────────────────────────────────────────────────────
+    msg = "Parent agent is consulting the LLM to divide the task into sub-tasks."
+    logger.info(msg)
+    yield {"type": "log", "message": msg}
+
+    planner_client = OpenAIChatCompletionClient(model=MODEL, api_key=api_key)
+    sub_tasks = await divide_task(task, planner_client)
+    await planner_client.close()
+
+    yield {"type": "subtasks", "subtasks": sub_tasks}
+    msg = f"Parent divided the task into {len(sub_tasks)} sub-tasks. The planner is done."
+    logger.info(msg)
+    yield {"type": "log", "message": msg}
+
+    # ── Stage 3: SPAWN ──────────────────────────────────────────────────────
+    registry = AgentRegistry()
+    msg = f"Parent agent is spawning {len(sub_tasks)} sub-agent(s)."
+    logger.info(msg)
+    yield {"type": "log", "message": msg}
+
+    spawned: list[tuple[AssistantAgent, object, str]] = []
+    for i, subtask in enumerate(sub_tasks, 1):
+        name = f"subagent_{i}"
+        agent, client = await spawn_subagent(name, subtask, MODEL, api_key)
+        registry.add(name, agent)
+        spawned.append((agent, client, subtask))
+        yield {"type": "log", "message": f"Sub-agent '{name}' has been born and assigned its sub-task."}
+
+    # ── Stage 4: EXECUTE (stream results as each sub-agent finishes) ─────────
+    msg = f"All {len(spawned)} sub-agent(s) are now working concurrently on their sub-tasks."
+    logger.info(msg)
+    yield {"type": "log", "message": msg}
+
+    async def _execute(agent, client, subtask):
+        result_text = await run_subagent(agent, subtask)
+        return {
+            "agent": agent.name,
+            "subtask": subtask,
+            "result": result_text,
+            "client": client,
+        }
+
+    sub_results = []
+    raw_results = []
+
+    for coro in asyncio.as_completed([_execute(a, c, s) for a, c, s in spawned]):
+        r = await coro
+        raw_results.append(r)
+        sub_results.append({"agent": r["agent"], "subtask": r["subtask"], "result": r["result"]})
+
+        # ── Stage 5: COLLECT (per-agent, streamed immediately) ────────────────
+        msg = f"Collected result from '{r['agent']}': work complete."
+        logger.info(msg)
+        yield {"type": "log", "message": msg}
+        yield {"type": "result", "agent": r["agent"], "subtask": r["subtask"], "result": r["result"]}
+
+    # ── Stage 6: DESTROY ─────────────────────────────────────────────────────
+    msg = "Parent agent is beginning the destruction of all sub-agents."
+    logger.info(msg)
+    yield {"type": "log", "message": msg}
+
+    for r in raw_results:
+        await destroy_subagent(r["agent"], r["client"], registry)
+        yield {"type": "log", "message": f"Sub-agent '{r['agent']}' has been destroyed. {registry.active_count()} sub-agent(s) remaining."}
+
+    # ── Synthesize ───────────────────────────────────────────────────────────
+    msg = "Parent agent is synthesizing all results into a final answer."
+    logger.info(msg)
+    yield {"type": "log", "message": msg}
+
+    combined = "\n\n".join(
+        f"[{r['agent']} on '{r['subtask']}']\n{r['result']}" for r in sub_results
+    )
+    synthesis_prompt = (
+        f"Original task: {task}\n\n"
+        f"Sub-agent results:\n{combined}\n\n"
+        "Please synthesize the above into one clear, final answer."
+    )
+
+    synth_client = OpenAIChatCompletionClient(model=MODEL, api_key=api_key)
+    synthesizer = AssistantAgent(
+        name="synthesizer",
+        model_client=synth_client,
+        system_message=_SYNTHESIZER_SYSTEM_PROMPT,
+    )
+    synth_result = await synthesizer.run(task=synthesis_prompt)
+    raw_synth = synth_result.messages[-1].content
+    if isinstance(raw_synth, list):
+        final_answer = " ".join(p.text if hasattr(p, "text") else str(p) for p in raw_synth)
+    else:
+        final_answer = str(raw_synth)
+
+    await synth_client.close()
+    msg = "The synthesizer agent has completed its work and has been destroyed."
+    logger.info(msg)
+    yield {"type": "log", "message": msg}
+
+    # ── Stage 7: RETURN ──────────────────────────────────────────────────────
+    msg = "Mitosys lifecycle complete. Returning the final answer to the caller."
+    logger.info(msg)
+    yield {"type": "log", "message": msg}
+
+    yield {"type": "final", "final_answer": final_answer}
+    yield {"type": "done"}

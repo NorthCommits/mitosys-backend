@@ -1,12 +1,14 @@
+import json
 import os
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app.logger import get_logger
-from app.orchestrator import run_mitosys
+from app.orchestrator import run_mitosys, run_mitosys_stream
 
 load_dotenv()
 
@@ -63,10 +65,36 @@ async def run(request: RunRequest):
             detail="OPENAI_API_KEY is not set. Please add it to your .env file.",
         )
 
-    logger.info(f"API received a new run request.")
+    logger.info("API received a new run request.")
     try:
         result = await run_mitosys(task)
         return result
     except Exception as exc:
         logger.error(f"An error occurred during the Mitosys run: {exc}")
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/run/stream")
+async def run_stream(request: RunRequest):
+    task = request.task.strip()
+    if not task:
+        raise HTTPException(status_code=400, detail="The 'task' field must not be empty.")
+
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    if not api_key:
+        raise HTTPException(
+            status_code=500,
+            detail="OPENAI_API_KEY is not set. Please add it to your .env file.",
+        )
+
+    logger.info("API received a new streaming run request.")
+
+    async def event_generator():
+        try:
+            async for event in run_mitosys_stream(task):
+                yield f"data: {json.dumps(event)}\n\n"
+        except Exception as exc:
+            logger.error(f"Error during streaming run: {exc}")
+            yield f"data: {json.dumps({'type': 'error', 'message': str(exc)})}\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
