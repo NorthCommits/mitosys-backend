@@ -1,3 +1,12 @@
+---
+title: Mitosys Backend
+emoji: 🧬
+colorFrom: green
+colorTo: blue
+sdk: docker
+pinned: false
+---
+
 # 🧬 Mitosys
 
 **Dynamic agent spawning, execution, and destruction — inspired by biological cell division.**
